@@ -18,7 +18,6 @@ private func plistToString(_ plist: UnsafeMutableRawPointer?) -> String {
     guard err.rawValue == 0, let xml else { return "<plist err \(err.rawValue)>" }
     return String(cString: xml)
 }
-
 private func freePlist(_ p: UnsafeMutableRawPointer?) { if let p { plist_free(p) } }
 
 private func ideviceErrorString(_ err: UnsafeMutablePointer<IdeviceFfiError>?) -> String? {
@@ -35,6 +34,24 @@ private func makeFileDomain(_ raw: Int) -> IdeviceFileServiceDomain {
 private func previewBytes(_ data: Data) -> String {
     if let text = String(data: data.prefix(65536), encoding: .utf8) { return text }
     return data.prefix(4096).map { String(format: "%02x", $0) }.joined()
+}
+
+private func stringFromC(_ ptr: UnsafePointer<CChar>?) -> String? {
+    guard let ptr else { return nil }
+    return String(cString: ptr)
+}
+
+extension Array where Element == String {
+    /// Returns true on success. `body(nil, 0)` for empty arrays.
+    func withCStringArray<R>(_ body: (UnsafePointer<UnsafePointer<CChar>?>?, UInt) -> R) -> R {
+        if isEmpty { return body(nil, 0) }
+        let cStrings = map { strdup($0) }
+        defer { cStrings.forEach { free($0) } }
+        var ptrs: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
+        return ptrs.withUnsafeBufferPointer { buf in
+            body(buf.baseAddress, UInt(ptrs.count))
+        }
+    }
 }
 
 // MARK: - tunnels
@@ -121,7 +138,38 @@ private enum Tunnel {
         }
     }
 
-    /// HouseArrest → AFC for a given app bundle. Returns the AFC client to body.
+    static func processControl<T>(hostname: String = "StikDebugPC",
+                                  _ body: (OpaquePointer) throws -> T) throws -> T {
+        try remoteServer(hostname: hostname) { server in
+            var h: OpaquePointer?
+            if let e = process_control_new(server, &h) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "process_control_new: \(ideviceErrorString(e) ?? "?")"])
+            }
+            guard let h else {
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "process_control nil"])
+            }
+            defer { process_control_free(h) }
+            return try body(h)
+        }
+    }
+
+    static func appService<T>(hostname: String = "StikDebugAS",
+                              _ body: (OpaquePointer) throws -> T) throws -> T {
+        try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
+            var h: OpaquePointer?
+            if let e = app_service_connect_rsd(adapter, handshake, &h) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "app_service_connect_rsd: \(ideviceErrorString(e) ?? "?")"])
+            }
+            guard let h else {
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "app_service nil"])
+            }
+            defer { app_service_free(h) }
+            return try body(h)
+        }
+    }
+
     static func houseArrest<T>(bundleID: String, hostname: String = "StikDebugHA",
                                _ body: (OpaquePointer) throws -> T) throws -> T {
         try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
@@ -149,11 +197,9 @@ private enum Tunnel {
         }
     }
 
-    /// DVT FileService: gives control channel, adapter, data port.
     static func fileService<T>(domain rawDomain: Int, bundleID: String, hostname: String = "StikDebugFS",
                                _ body: (OpaquePointer, OpaquePointer, UInt16) throws -> T) throws -> T {
         try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
-            // 1. find data port
             var dataPort: UInt16 = 0
             var services: UnsafeMutablePointer<CRsdServiceArray>?
             if let e = rsd_get_services(handshake, &services) {
@@ -177,7 +223,6 @@ private enum Tunnel {
                               userInfo: [NSLocalizedDescriptionKey: "fileservice.data port not found"])
             }
 
-            // 2. control channel
             var control: OpaquePointer?
             if let e = file_service_connect_rsd(adapter, handshake, &control) {
                 throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
@@ -188,7 +233,6 @@ private enum Tunnel {
             }
             defer { file_service_free(control) }
 
-            // 3. session
             let domain = makeFileDomain(rawDomain)
             let needsIdent = (domain.rawValue == 1 || domain.rawValue == 2)
             var sessionID: UnsafeMutablePointer<CChar>?
@@ -221,14 +265,28 @@ final class DebugServerViewModel: ObservableObject {
 
     @Published var pid: String = ""
     @Published var signal: String = "15"
-    @Published var bundleID: String = "com.stik.stikdebug"
+    @Published var bundleID: String = "com.apple.mobilesafari"
     @Published var filePath: String = "/var/mobile/Library/Logs/CrashReporter"
     @Published var fileContent: String = ""
-    @Published var dvtDomainRaw: Int = 5    // 1 AppData, 2 AppGroup, 3 Temporary, 5 CrashLogs
+    @Published var dvtDomainRaw: Int = 5
+
     @Published var latitude: String = "55.7558"
     @Published var longitude: String = "37.6173"
     @Published var notificationName: String = "com.apple.springboard.lockcomplete"
     @Published var mgKeys: String = "ProductType,ProductVersion,BuildVersion,UniqueDeviceID,SerialNumber,HWModel,CPUArchitecture,MarketingName"
+
+    // Process Control
+    @Published var launchBundle: String = "com.apple.Preferences"
+    @Published var launchEnv: String = ""
+    @Published var launchArgs: String = ""
+    @Published var startSuspended = false
+    @Published var killExisting = false
+    @Published var lastLaunchedPID: String = ""
+
+    init() {
+        // Global TCP timeout — prevents deadlocks in DVT / debug / os_trace reads
+        idevice_set_global_timeout(5)
+    }
 
     private func start(_ label: String) { busy = true; status = label; output = "" }
 
@@ -413,7 +471,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func powerShutdown() {
         run("Shutting down…") {
             try Tunnel.diagnostics { c in
@@ -425,7 +482,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func powerSleep() {
         run("Sleeping…") {
             try Tunnel.diagnostics { c in
@@ -452,7 +508,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func configGetStyle() {
         run("Get UI style…") {
             try Tunnel.config { c in
@@ -465,7 +520,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func configReduceMotion(_ on: Bool) {
         run("Reduce Motion \(on)…") {
             try Tunnel.config { c in
@@ -477,7 +531,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func configReduceTransparency(_ on: Bool) {
         run("Reduce Transparency \(on)…") {
             try Tunnel.config { c in
@@ -489,7 +542,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func configShowBorders(_ on: Bool) {
         run("Show Borders \(on)…") {
             try Tunnel.config { c in
@@ -501,7 +553,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func configSetTextSize(_ size: String) {
         run("Text size \(size)…") {
             try Tunnel.config { c in
@@ -530,7 +581,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func clearLocation() {
         run("Clear location…") {
             try Tunnel.locationSim { c in
@@ -543,7 +593,7 @@ final class DebugServerViewModel: ObservableObject {
         }
     }
 
-    // MARK: Notifications
+    // MARK: Notifications (proxy)
 
     func postNotification() {
         let n = notificationName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -581,7 +631,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func devNetwork() {
         run("Network info…") {
             try Tunnel.remoteServer { server in
@@ -602,7 +651,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func devKernel() {
         run("Kernel name…") {
             try Tunnel.remoteServer { server in
@@ -623,7 +671,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
     func devProcesses() {
         run("Running processes…") {
             try Tunnel.remoteServer { server in
@@ -703,8 +750,7 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 defer { if let data { idevice_data_free(data, len) } }
                 guard let data, len > 0 else { return "<empty>" }
-                let raw = Data(bytes: data, count: Int(len))
-                return previewBytes(raw)
+                return previewBytes(Data(bytes: data, count: Int(len)))
             }
         }
     }
@@ -727,8 +773,6 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
-
-    // MARK: Files (AFC, own container)
 
     func readFileAFC() {
         let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -765,11 +809,9 @@ final class DebugServerViewModel: ObservableObject {
         run("AFC write \(path)…") {
             try Tunnel.houseArrest(bundleID: bundle) { afc in
                 var fh: OpaquePointer?
-                // try write-only first; if file exists it works
                 if let e = path.withCString({ afc_file_open(afc, $0, AfcWr, &fh) }) {
                     idevice_error_free(e)
                     fh = nil
-                    // try create (AfcWrOnly creates if missing)
                     if let e2 = path.withCString({ afc_file_open(afc, $0, AfcWrOnly, &fh) }) {
                         throw NSError(domain: "afc", code: Int(e2.pointee.code),
                                       userInfo: [NSLocalizedDescriptionKey: "open: \(ideviceErrorString(e2) ?? "?")"])
@@ -795,7 +837,7 @@ final class DebugServerViewModel: ObservableObject {
         }
     }
 
-    // MARK: Apps
+    // MARK: Apps (InstallationProxy)
 
     func appList() {
         run("InstallationProxy browse…") {
@@ -822,7 +864,7 @@ final class DebugServerViewModel: ObservableObject {
         }
     }
 
-    // MARK: Processes
+    // MARK: Processes (JITEnableContext)
 
     func listProcesses() {
         run("List processes…") {
@@ -835,7 +877,6 @@ final class DebugServerViewModel: ObservableObject {
             }.joined(separator: "\n")
         }
     }
-
     func sendSignal() {
         guard let p = Int32(pid), let s = Int32(signal) else { output = "✗ pid/sig"; return }
         run("Signal \(s) → \(p)…") {
@@ -843,12 +884,278 @@ final class DebugServerViewModel: ObservableObject {
             return "OK"
         }
     }
-
     func killProcess() {
         guard let p = Int32(pid) else { output = "✗ pid"; return }
         run("Kill \(p)…") {
             try JITEnableContext.shared.killProcess(withPID: p)
             return "OK"
+        }
+    }
+
+    // MARK: Process Control (process_control_*)
+
+    func pcLaunchApp() {
+        let bundle = launchBundle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundle.isEmpty else { output = "✗ empty bundle"; return }
+        let env = launchEnv.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let args = launchArgs.split(separator: "\n").map { String($0) }.filter { !$0.isEmpty }
+        let susp = startSuspended
+        let killEx = killExisting
+        run("process_control launch \(bundle)…") {
+            try Tunnel.processControl { h in
+                var pidOut: UInt64 = 0
+                let err: UnsafeMutablePointer<IdeviceFfiError>? = env.withCStringArray { envPtr, envCount in
+                    args.withCStringArray { argPtr, argCount in
+                        bundle.withCString { bid in
+                            process_control_launch_app(
+                                h, bid,
+                                envPtr, envCount,
+                                argPtr, argCount,
+                                susp, killEx,
+                                &pidOut
+                            )
+                        }
+                    }
+                }
+                if let err {
+                    throw NSError(domain: "pc", code: Int(err.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "launch: \(ideviceErrorString(err) ?? "?")"])
+                }
+                await_setLastPID(pidOut)
+                return "OK — launched pid \(pidOut)"
+            }
+        }
+    }
+
+    nonisolated private func await_setLastPID(_ pid: UInt64) {
+        Task { @MainActor [weak self] in
+            self?.lastLaunchedPID = String(pid)
+        }
+    }
+
+    func pcKillApp() {
+        guard let p = UInt64(pid) else { output = "✗ pid"; return }
+        run("process_control kill \(p)…") {
+            try Tunnel.processControl { h in
+                if let e = process_control_kill_app(h, p) {
+                    throw NSError(domain: "pc", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "kill: \(ideviceErrorString(e) ?? "?")"])
+                }
+                return "OK — killed pid \(p)"
+            }
+        }
+    }
+
+    func pcDisableMemoryLimit() {
+        guard let p = UInt64(pid) else { output = "✗ pid"; return }
+        run("disable memory limit \(p)…") {
+            try Tunnel.processControl { h in
+                if let e = process_control_disable_memory_limit(h, p) {
+                    throw NSError(domain: "pc", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "disable_limit: \(ideviceErrorString(e) ?? "?")"])
+                }
+                return "OK — limit disabled for pid \(p)"
+            }
+        }
+    }
+
+    // MARK: AppService
+
+    func asLaunchApp() {
+        let bundle = launchBundle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundle.isEmpty else { output = "✗ empty bundle"; return }
+        let args = launchArgs.split(separator: "\n").map { String($0) }.filter { !$0.isEmpty }
+        let susp = startSuspended
+        let killEx = killExisting
+        run("app_service launch \(bundle)…") {
+            try Tunnel.appService { h in
+                var response: UnsafeMutablePointer<LaunchResponseC>?
+                let err: UnsafeMutablePointer<IdeviceFfiError>? = args.withCStringArray { argPtr, argCount in
+                    bundle.withCString { bid in
+                        app_service_launch_app(
+                            h, bid,
+                            argPtr, argCount,
+                            killEx ? 1 : 0,
+                            susp ? 1 : 0,
+                            nil,
+                            &response
+                        )
+                    }
+                }
+                if let err {
+                    throw NSError(domain: "as", code: Int(err.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "launch: \(ideviceErrorString(err) ?? "?")"])
+                }
+                defer { if let response { app_service_free_launch_response(response) } }
+                guard let response else { return "<nil>" }
+                let pid = response.pointee.pid
+                let path = response.pointee.executable_url.map { String(cString: $0) } ?? "?"
+                await_setLastPID(UInt64(pid))
+                return "OK — pid \(pid)\nurl: \(path)"
+            }
+        }
+    }
+
+    func asSendSignal() {
+        guard let p = UInt32(pid) else { output = "✗ pid"; return }
+        guard let s = UInt32(signal) else { output = "✗ signal"; return }
+        run("app_service signal \(s) → \(p)…") {
+            try Tunnel.appService { h in
+                var response: UnsafeMutablePointer<SignalResponseC>?
+                if let e = app_service_send_signal(h, p, s, &response) {
+                    throw NSError(domain: "as", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "signal: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let response { app_service_free_signal_response(response) } }
+                guard let response else { return "OK (no response)" }
+                let path = response.pointee.executable_url.map { String(cString: $0) } ?? "?"
+                return "OK — pid \(response.pointee.pid), signal \(response.pointee.signal)\nurl: \(path)"
+            }
+        }
+    }
+
+    func asUninstall() {
+        let bundle = launchBundle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bundle.isEmpty else { output = "✗ empty bundle"; return }
+        run("uninstall \(bundle)…") {
+            try Tunnel.appService { h in
+                if let e = bundle.withCString({ app_service_uninstall_app(h, $0) }) {
+                    throw NSError(domain: "as", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "uninstall: \(ideviceErrorString(e) ?? "?")"])
+                }
+                return "OK — uninstalled \(bundle)"
+            }
+        }
+    }
+
+    // MARK: Live — Notifications
+
+    func liveNotificationsOne() {
+        run("Notifications next…") {
+            try Tunnel.remoteServer(hostname: "StikDebugLiveNotif") { server in
+                var h: OpaquePointer?
+                if let e = notifications_new(server, &h) {
+                    throw NSError(domain: "ntf", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "notifications_new: \(ideviceErrorString(e) ?? "?")"])
+                }
+                guard let h else { throw NSError(domain: "ntf", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
+                defer { notifications_free(h) }
+                if let e = notifications_start(h) {
+                    throw NSError(domain: "ntf", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "start: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { _ = notifications_stop(h) }
+
+                var info: UnsafeMutablePointer<IdeviceNotificationInfo>?
+                if let e = notifications_get_next(h, &info) {
+                    throw NSError(domain: "ntf", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "next: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let info { notifications_info_free(info) } }
+                guard let info else { return "<nil>" }
+                let p = info.pointee
+                let type = stringFromC(p.notification_type) ?? "?"
+                let exec = stringFromC(p.exec_name) ?? "?"
+                let app = stringFromC(p.app_name) ?? "?"
+                let state = stringFromC(p.state_description) ?? "?"
+                return "type: \(type)\npid: \(p.pid)\nexec: \(exec)\napp: \(app)\nstate: \(state)"
+            }
+        }
+    }
+
+    // MARK: Live — Network
+
+    func liveNetworkOne() {
+        run("Network next…") {
+            try Tunnel.remoteServer(hostname: "StikDebugLiveNet") { server in
+                var h: OpaquePointer?
+                if let e = network_monitor_new(server, &h) {
+                    throw NSError(domain: "net", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "network_monitor_new: \(ideviceErrorString(e) ?? "?")"])
+                }
+                guard let h else { throw NSError(domain: "net", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
+                defer { network_monitor_free(h) }
+                if let e = network_monitor_start(h) {
+                    throw NSError(domain: "net", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "start: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { _ = network_monitor_stop(h) }
+
+                var event: UnsafeMutablePointer<IdeviceNetworkEvent>?
+                if let e = network_monitor_next_event(h, &event) {
+                    throw NSError(domain: "net", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "next: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let event { network_monitor_event_free(event) } }
+                guard let event else { return "<nil>" }
+                let e = event.pointee
+                let iface = stringFromC(e.interface_name) ?? "?"
+                let localAddr = stringFromC(e.local_addr.addr) ?? "?"
+                let remoteAddr = stringFromC(e.remote_addr.addr) ?? "?"
+                return """
+                type: \(e.event_type.rawValue) (\(e.event_type))
+                iface: \(iface) idx=\(e.interface_index)
+                pid: \(e.pid)
+                local: \(localAddr):\(e.local_addr.port)
+                remote: \(remoteAddr):\(e.remote_addr.port)
+                rx: \(e.rx_packets) pkts / \(e.rx_bytes) b
+                tx: \(e.tx_packets) pkts / \(e.tx_bytes) b
+                rtt: min=\(e.min_rtt) avg=\(e.avg_rtt)
+                retx: \(e.tx_retx)
+                """
+            }
+        }
+    }
+
+    // MARK: Live — OS Trace
+
+    func liveOSTraceOne() {
+        run("OS Trace next…") {
+            try JITEnableContext.shared.withFreshDebugTunnel(hostname: "StikDebugLiveTrace") { adapter, handshake in
+                var client: OpaquePointer?
+                if let e = os_trace_relay_connect_rsd(adapter, handshake, &client) {
+                    throw NSError(domain: "trace", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "connect: \(ideviceErrorString(e) ?? "?")"])
+                }
+                guard let client else {
+                    throw NSError(domain: "trace", code: -1, userInfo: [NSLocalizedDescriptionKey: "client nil"])
+                }
+                // start_trace CONSUMES client — do NOT free client afterwards
+                var receiver: OpaquePointer?
+                if let e = os_trace_relay_start_trace(client, &receiver, nil) {
+                    // if start failed, we still own client
+                    os_trace_relay_free(client)
+                    throw NSError(domain: "trace", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "start_trace: \(ideviceErrorString(e) ?? "?")"])
+                }
+                guard let receiver else {
+                    throw NSError(domain: "trace", code: -1, userInfo: [NSLocalizedDescriptionKey: "receiver nil"])
+                }
+                defer { os_trace_relay_receiver_free(receiver) }
+
+                var log: UnsafeMutablePointer<OsTraceLog>?
+                if let e = os_trace_relay_next(receiver, &log) {
+                    throw NSError(domain: "trace", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "next: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let log { os_trace_relay_free_log(log) } }
+                guard let log else { return "<nil>" }
+                let l = log.pointee
+                let image = stringFromC(l.image_name) ?? "?"
+                let file = stringFromC(l.filename) ?? "?"
+                let msg = stringFromC(l.message) ?? "?"
+                let sub = l.label.flatMap { stringFromC($0.pointee.subsystem) } ?? ""
+                let cat = l.label.flatMap { stringFromC($0.pointee.category) } ?? ""
+                return """
+                ts: \(l.timestamp)
+                pid: \(l.pid) tid: \(l.thread_id)
+                level: \(l.level)
+                image: \(image) (\(l.image_offset))
+                file: \(file)
+                label: \(sub)/\(cat)
+                msg: \(msg)
+                """
+            }
         }
     }
 
@@ -976,7 +1283,7 @@ struct DebugServerView: View {
                 Text("Device").tag(6)
                 Text("Files").tag(7)
                 Text("Apps").tag(8)
-                Text("Proc").tag(9)
+                Text("Process").tag(9)
                 Text("Monitor").tag(10)
             }
             .pickerStyle(.segmented)
@@ -1006,7 +1313,7 @@ struct DebugServerView: View {
         case 6: deviceTab
         case 7: filesTab
         case 8: appsTab
-        case 9: procTab
+        case 9: processTab
         case 10: monitorTab
         default: EmptyView()
         }
@@ -1103,10 +1410,8 @@ struct DebugServerView: View {
     @ViewBuilder private var filesTab: some View {
         TextField("Bundle ID (for AFC / App domain)", text: $m.bundleID)
             .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
-
         TextField("Path", text: $m.filePath)
             .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
-
         ScrollView(.horizontal, showsIndicators: false) {
             HStack {
                 ForEach(["/", "/var/mobile", "/var/mobile/Media",
@@ -1118,8 +1423,6 @@ struct DebugServerView: View {
                 }
             }
         }
-
-        // DVT
         HStack {
             Text("DVT domain:").font(.caption).foregroundStyle(.secondary)
             Picker("", selection: $m.dvtDomainRaw) {
@@ -1132,8 +1435,6 @@ struct DebugServerView: View {
         btn("List directory (DVT)") { m.devDirListing() }
         btn("Read file (DVT)", color: .green) { m.readFileDVT() }
         btn("Create empty file (DVT)", color: .purple) { m.proposeEmptyFileDVT() }
-
-        // AFC
         Divider().padding(.vertical, 4)
         Text("AFC (own container only)").font(.caption).foregroundStyle(.secondary)
         btn("Read file (AFC)", color: .blue) { m.readFileAFC() }
@@ -1148,23 +1449,57 @@ struct DebugServerView: View {
         btn("Browse installed apps") { m.appList() }
     }
 
-    @ViewBuilder private var procTab: some View {
+    @ViewBuilder private var processTab: some View {
+        // Common fields
+        TextField("Bundle ID", text: $m.launchBundle)
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
         HStack {
             TextField("PID", text: $m.pid).keyboardType(.numberPad).textFieldStyle(.roundedBorder)
             TextField("Signal", text: $m.signal).keyboardType(.numberPad).textFieldStyle(.roundedBorder)
         }
-        btn("List processes") { m.listProcesses() }
+
+        // launch options
+        TextField("Env (KEY=VAL per line)", text: $m.launchEnv, axis: .vertical)
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
+            .lineLimit(2...6)
+        TextField("Arguments (one per line)", text: $m.launchArgs, axis: .vertical)
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
+            .lineLimit(1...4)
         HStack {
-            btn("Send signal") { m.sendSignal() }
-            btn("Kill process", color: .red) { m.killProcess() }
+            Toggle("start_suspended", isOn: $m.startSuspended)
+            Toggle("kill_existing", isOn: $m.killExisting)
         }
-        ScrollView(.horizontal) {
-            HStack {
-                ForEach(["9","15","18","19","1"], id: \.self) { s in
-                    Button("SIG\(s)") { m.signal = s }
-                        .font(.caption2).buttonStyle(.bordered)
-                }
-            }
+
+        // process_control
+        Text("process_control").font(.caption).foregroundStyle(.secondary)
+        btn("Launch (PC)", color: .green) { m.pcLaunchApp() }
+        btn("Kill PID (PC)", color: .red) { m.pcKillApp() }
+        btn("Disable memory limit (PC)", color: .orange) { m.pcDisableMemoryLimit() }
+
+        // app_service
+        Divider().padding(.vertical, 4)
+        Text("app_service").font(.caption).foregroundStyle(.secondary)
+        btn("Launch (AS)", color: .green) { m.asLaunchApp() }
+        btn("Send signal (AS)", color: .red) { m.asSendSignal() }
+        btn("Uninstall app (AS)", color: .pink) { m.asUninstall() }
+
+        // JITEnableContext (classic)
+        Divider().padding(.vertical, 4)
+        Text("jit_enable").font(.caption).foregroundStyle(.secondary)
+        btn("List processes") { m.listProcesses() }
+        btn("Send signal (JIT)") { m.sendSignal() }
+        btn("Kill process (JIT)", color: .red) { m.killProcess() }
+
+        // live
+        Divider().padding(.vertical, 4)
+        Text("live (one-shot, may block up to 5s)").font(.caption).foregroundStyle(.secondary)
+        btn("Notifications: next", color: .blue) { m.liveNotificationsOne() }
+        btn("Network: next", color: .blue) { m.liveNetworkOne() }
+        btn("OS Trace: next", color: .blue) { m.liveOSTraceOne() }
+
+        if !m.lastLaunchedPID.isEmpty {
+            Text("last launched pid: \(m.lastLaunchedPID)")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
