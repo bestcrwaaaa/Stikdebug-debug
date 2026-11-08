@@ -80,7 +80,6 @@ final class DebugServerViewModel: ObservableObject {
         }
     }
 
-    /// Send one command over the DVT debug proxy.
     nonisolated private static func send(
         _ command: String,
         collectAll: Bool
@@ -91,25 +90,33 @@ final class DebugServerViewModel: ObservableObject {
             ) { adapter, handshake -> String in
                 var debugProxy: OpaquePointer?
                 if let ffiError = debug_proxy_connect_rsd(adapter, handshake, &debugProxy) {
-                    let message = ffiError.pointee.message
-                        .map { String(cString: $0) } ?? "unknown"
+                    let msg = ffiError.pointee.message.map { String(cString: $0) } ?? "unknown"
                     let code = ffiError.pointee.code
                     idevice_error_free(ffiError)
                     throw NSError(
                         domain: "StikDebug",
                         code: Int(code),
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "Failed to connect the debug proxy: \(message)"]
+                        userInfo: [NSLocalizedDescriptionKey: "connect debug proxy: \(msg)"]
                     )
                 }
                 defer { if let debugProxy { debug_proxy_free(debugProxy) } }
 
+                // 1. Отключаем ACK-режим, иначе platform shell зависает
+                if let ackCmd = debugserver_command_new("QStartNoAckMode", nil, 0) {
+                    var ackResp: UnsafeMutablePointer<CChar>?
+                    let ackErr = debug_proxy_send_command(debugProxy, ackCmd, &ackResp)
+                    if let ackResp { idevice_string_free(ackResp) }
+                    debugserver_command_free(ackCmd)
+                    if let ackErr { idevice_error_free(ackErr) }
+                    debug_proxy_set_ack_mode(debugProxy, 0)
+                }
+
+                // 2. Создаём и отправляем саму команду
                 guard let commandHandle = debugserver_command_new(command, nil, 0) else {
                     throw NSError(
                         domain: "StikDebug",
                         code: -1,
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "Failed to create the debug server command."]
+                        userInfo: [NSLocalizedDescriptionKey: "create command failed"]
                     )
                 }
                 defer { debugserver_command_free(commandHandle) }
@@ -118,15 +125,13 @@ final class DebugServerViewModel: ObservableObject {
                 let ffiError = debug_proxy_send_command(debugProxy, commandHandle, &first)
                 if let ffiError {
                     if let first { idevice_string_free(first) }
-                    let message = ffiError.pointee.message
-                        .map { String(cString: $0) } ?? "unknown"
+                    let msg = ffiError.pointee.message.map { String(cString: $0) } ?? "unknown"
                     let code = ffiError.pointee.code
                     idevice_error_free(ffiError)
                     throw NSError(
                         domain: "StikDebug",
                         code: Int(code),
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "The debug server refused the command: \(message)"]
+                        userInfo: [NSLocalizedDescriptionKey: "send command: \(msg)"]
                     )
                 }
 
@@ -136,8 +141,8 @@ final class DebugServerViewModel: ObservableObject {
                     idevice_string_free(first)
                 }
 
+                // 3. Читаем всё до конца (с ограничением на 512 итераций)
                 if collectAll {
-                    // The device closes the channel when the command finishes.
                     for _ in 0..<512 {
                         var chunk: UnsafeMutablePointer<CChar>?
                         if let readError = debug_proxy_read_response(debugProxy, &chunk) {
@@ -184,14 +189,31 @@ final class DebugServerViewModel: ObservableObject {
             let result: Result<String, Error>
             do {
                 let processes = try JITEnableContext.shared.fetchProcessList()
-                let text = processes
-                    .map { entry -> String in
-                        let name = entry["name"] as? String ?? "?"
-                        let pid = entry["pid"] as? Int ?? 0
-                        let executable = entry["executablePath"] as? String ?? ""
-                        return "\(pid)\t\(name)\t\(executable)"
-                    }
-                    .joined(separator: "\n")
+
+                // Дамп первого словаря для отладки ключей
+                if let first = processes.first {
+                    print("=== PROCESS DICT KEYS: \(first.keys) ===")
+                    print("=== PROCESS DICT: \(first) ===")
+                }
+
+                let text = processes.map { entry -> String in
+                    let name = (entry["name"] as? String)
+                        ?? (entry["Name"] as? String)
+                        ?? (entry["executable"] as? String)
+                        ?? (entry["Executable"] as? String)
+                        ?? "?"
+                    let pidValue = (entry["pid"] as? Int)
+                        ?? (entry["PID"] as? Int)
+                        ?? (entry["pid"] as? Int32).map { Int($0) }
+                        ?? 0
+                    let path = (entry["executablePath"] as? String)
+                        ?? (entry["path"] as? String)
+                        ?? (entry["Path"] as? String)
+                        ?? (entry["bundleIdentifier"] as? String)
+                        ?? ""
+                    return "\(pidValue)\t\(name)\t\(path)"
+                }.joined(separator: "\n")
+
                 result = .success(text)
             } catch {
                 result = .failure(error)
