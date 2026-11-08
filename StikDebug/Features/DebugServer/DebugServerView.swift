@@ -5,6 +5,7 @@
 
 import SwiftUI
 import UIKit
+import idevice
 
 @MainActor
 final class DebugServerViewModel: ObservableObject {
@@ -43,25 +44,135 @@ final class DebugServerViewModel: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !busy else { return }
 
+        let payload = shellMode && !trimmed.hasPrefix("platform shell")
+            ? "platform shell \(trimmed)"
+            : trimmed
+
         command = text
         if !history.contains(trimmed) { history.insert(trimmed, at: 0) }
         if history.count > 50 { history.removeLast(history.count - 50) }
 
-        // Raw command execution via debug proxy is not wired up in this build.
-        // (Needs a proper bridging header exposing debug_proxy_* / debugserver_command_new.)
-        output = "✗ Raw command execution is not available in this build.\n"
-            + "Use the action buttons below (List processes, Send signal, Kill process)."
-        status = "Unavailable"
+        busy = true
+        output = ""
+        status = "Running…"
+
+        let collect = collectAll
+        Task.detached(priority: .userInitiated) {
+            let started = Date()
+            let result = Self.send(payload, collectAll: collect)
+            let elapsed = Date().timeIntervalSince(started)
+
+            await MainActor.run {
+                self.busy = false
+                switch result {
+                case let .success(text):
+                    self.output = text
+                    self.status = String(
+                        format: "Done in %.2fs · %d byte(s)",
+                        elapsed,
+                        text.utf8.count
+                    )
+                case let .failure(error):
+                    self.output = "✗ " + error.localizedDescription
+                    self.status = String(format: "Failed after %.2fs", elapsed)
+                }
+            }
+        }
+    }
+
+    /// Send one command over the DVT debug proxy.
+    nonisolated private static func send(
+        _ command: String,
+        collectAll: Bool
+    ) -> Result<String, Error> {
+        do {
+            let response = try JITEnableContext.shared.withFreshDebugTunnel(
+                hostname: "StikDebugDebugServer"
+            ) { adapter, handshake -> String in
+                var debugProxy: OpaquePointer?
+                if let ffiError = debug_proxy_connect_rsd(adapter, handshake, &debugProxy) {
+                    let message = ffiError.pointee.message
+                        .map { String(cString: $0) } ?? "unknown"
+                    let code = ffiError.pointee.code
+                    idevice_error_free(ffiError)
+                    throw NSError(
+                        domain: "StikDebug",
+                        code: Int(code),
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Failed to connect the debug proxy: \(message)"]
+                    )
+                }
+                defer { if let debugProxy { debug_proxy_free(debugProxy) } }
+
+                guard let commandHandle = debugserver_command_new(command, nil, 0) else {
+                    throw NSError(
+                        domain: "StikDebug",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Failed to create the debug server command."]
+                    )
+                }
+                defer { debugserver_command_free(commandHandle) }
+
+                var first: UnsafeMutablePointer<CChar>?
+                let ffiError = debug_proxy_send_command(debugProxy, commandHandle, &first)
+                if let ffiError {
+                    if let first { idevice_string_free(first) }
+                    let message = ffiError.pointee.message
+                        .map { String(cString: $0) } ?? "unknown"
+                    let code = ffiError.pointee.code
+                    idevice_error_free(ffiError)
+                    throw NSError(
+                        domain: "StikDebug",
+                        code: Int(code),
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "The debug server refused the command: \(message)"]
+                    )
+                }
+
+                var parts: [String] = []
+                if let first {
+                    parts.append(String(cString: first))
+                    idevice_string_free(first)
+                }
+
+                if collectAll {
+                    // The device closes the channel when the command finishes.
+                    for _ in 0..<512 {
+                        var chunk: UnsafeMutablePointer<CChar>?
+                        if let readError = debug_proxy_read_response(debugProxy, &chunk) {
+                            if let chunk { idevice_string_free(chunk) }
+                            idevice_error_free(readError)
+                            break
+                        }
+                        guard let chunk else { break }
+                        let text = String(cString: chunk)
+                        idevice_string_free(chunk)
+                        if text.isEmpty { break }
+                        parts.append(text)
+                    }
+                }
+
+                return parts.joined()
+            }
+            return .success(response)
+        } catch {
+            return .failure(error)
+        }
     }
 
     func readFile() {
+        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return }
         fileContent = ""
-        run("cat \(filePath)")
+        run("cat \(path)")
     }
 
     func writeFile() {
+        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return }
         let encoded = Data(fileContent.utf8).base64EncodedString()
-        run("echo \(encoded) | base64 -d > \(filePath)")
+        run("echo \(encoded) | base64 -d > \(path)")
     }
 
     func listProcesses() {
@@ -212,6 +323,8 @@ struct DebugServerView: View {
                 }
             } header: {
                 Text("Command")
+            } footer: {
+                Text("Type a command and it runs on the device. With shell mode on, the text is sent as `platform shell <command>`; with it off, the text goes to the debug server verbatim.")
             }
 
             Section {
