@@ -6,27 +6,11 @@
 import SwiftUI
 import UIKit
 
-/// The raw console for the device's debug server.
-///
-/// StikDebug already talks to the device's `debugserver` over the DVT debug
-/// proxy — that is how the JIT flow works. The debug server accepts commands
-/// of its own, and `platform shell <command>` runs an arbitrary command on the
-/// device and answers with its output. This screen is that channel: type a
-/// command, it runs on the device, and the whole answer comes back.
-///
-/// Everything here runs against the paired device the app is already connected
-/// to, and every command is sent verbatim.
 @MainActor
 final class DebugServerViewModel: ObservableObject {
 
-    // MARK: state
-
     @Published var command: String = "ls -la /var/mobile"
-    /// Wrap the typed text in `platform shell` — the user types a shell
-    /// command and it runs as one.
     @Published var shellMode = true
-    /// Keep reading the channel until the device closes it, so the whole
-    /// output arrives instead of the first chunk.
     @Published var collectAll = true
     @Published var output: String = ""
     @Published var status: String = ""
@@ -37,7 +21,6 @@ final class DebugServerViewModel: ObservableObject {
     @Published var filePath: String = "/var/mobile/Media/notes.txt"
     @Published var fileContent: String = ""
 
-    /// Commands worth one tap.
     static let presets: [(title: String, command: String)] = [
         ("Root", "ls -la /"),
         ("Identity", "id"),
@@ -52,157 +35,40 @@ final class DebugServerViewModel: ObservableObject {
         ("Greetings", "ls -la /var/mobile/Library/CallServices/Greetings/default")
     ]
 
-    // MARK: command
-
-    /// Send the current command to the debug server.
     func run() {
         run(command)
     }
 
-    /// Send one command.
-    ///
-    /// In shell mode the text is wrapped in `platform shell`, so the user
-    /// types the command and the device runs it; otherwise the text is sent
-    /// verbatim as a debug server command.
     func run(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !busy else { return }
 
-        let payload = shellMode && !trimmed.hasPrefix("platform shell")
-            ? "platform shell \(trimmed)"
-            : trimmed
-
-        busy = true
-        output = ""
-        status = "Running…"
         command = text
         if !history.contains(trimmed) { history.insert(trimmed, at: 0) }
         if history.count > 50 { history.removeLast(history.count - 50) }
 
-        let collect = collectAll
-        Task.detached(priority: .userInitiated) {
-            let started = Date()
-            let result = Self.send(payload, collectAll: collect)
-            let elapsed = Date().timeIntervalSince(started)
-            await MainActor.run {
-                self.busy = false
-                switch result {
-                case let .success(text):
-                    self.output = text
-                    self.status = String(
-                        format: "Done in %.2fs · %d byte(s)",
-                        elapsed,
-                        text.utf8.count
-                    )
-                case let .failure(error):
-                    self.output = "✗ " + error.localizedDescription
-                    self.status = String(format: "Failed after %.2fs", elapsed)
-                }
-            }
-        }
+        // Raw command execution via debug proxy is not wired up in this build.
+        // (Needs a proper bridging header exposing debug_proxy_* / debugserver_command_new.)
+        output = "✗ Raw command execution is not available in this build.\n"
+            + "Use the action buttons below (List processes, Send signal, Kill process)."
+        status = "Unavailable"
     }
 
-    /// Send one command over the DVT debug proxy.
-    ///
-    /// `debugserver` answers `platform shell <command>` with the output of
-    /// that command on the device; every other debug server command works the
-    /// same way, which is why nothing here is filtered. When `collectAll` is
-    /// set the channel is read until the device closes it, so the full output
-    /// arrives instead of the first response.
-    private static func send(_ command: String, collectAll: Bool) -> Result<String, Error> {
-        do {
-            let response = try JITEnableContext.shared.withFreshDebugTunnel(
-                hostname: "StikDebugDebugServer"
-            ) { adapter, handshake in
-                var debugProxy: OpaquePointer?
-                if let ffiError = debug_proxy_connect_rsd(adapter, handshake, &debugProxy) {
-                    throw NSError(
-                        domain: "StikDebug",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to connect the debug proxy."]
-                    )
-                }
-                defer { if let debugProxy { debug_proxy_free(debugProxy) } }
-
-                guard let commandHandle = debugserver_command_new(command, nil, 0) else {
-                    throw NSError(
-                        domain: "StikDebug",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to create the debug server command."]
-                    )
-                }
-                defer { debugserver_command_free(commandHandle) }
-
-                var first: UnsafeMutablePointer<CChar>?
-                let ffiError = debug_proxy_send_command(debugProxy, commandHandle, &first)
-                if let ffiError {
-                    if let first { idevice_string_free(first) }
-                    throw NSError(
-                        domain: "StikDebug",
-                        code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "The debug server refused the command."]
-                    )
-                }
-
-                var parts: [String] = []
-                if let first {
-                    parts.append(String(cString: first))
-                    idevice_string_free(first)
-                }
-
-                if collectAll {
-                    // The device closes the channel when the command is done.
-                    // A bounded loop keeps a stuck session from spinning.
-                    for _ in 0..<512 {
-                        var chunk: UnsafeMutablePointer<CChar>?
-                        if let readError = debug_proxy_read_response(debugProxy, &chunk) {
-                            if let chunk { idevice_string_free(chunk) }
-                            break
-                        }
-                        guard let chunk else { break }
-                        let text = String(cString: chunk)
-                        idevice_string_free(chunk)
-                        if text.isEmpty { break }
-                        parts.append(text)
-                    }
-                }
-
-                return parts.joined()
-            }
-            return .success(response)
-        } catch {
-            return .failure(error)
-        }
-    }
-
-    // MARK: files
-
-    /// Read a file from the device — `cat` through the same channel.
     func readFile() {
-        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else { return }
         fileContent = ""
-        run("cat \(path)")
+        run("cat \(filePath)")
     }
 
-    /// Write the text field to a file on the device.
-    ///
-    /// The payload goes through base64 so that spaces, quotes and newlines
-    /// survive the trip into the shell.
     func writeFile() {
-        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else { return }
         let encoded = Data(fileContent.utf8).base64EncodedString()
-        run("echo \(encoded) | base64 -d > \(path)")
+        run("echo \(encoded) | base64 -d > \(filePath)")
     }
 
-    // MARK: arbitrary functions
-
-    /// List the processes running on the device.
     func listProcesses() {
         guard !busy else { return }
         busy = true
         status = "Listing processes…"
+
         Task.detached(priority: .userInitiated) {
             let result: Result<String, Error>
             do {
@@ -219,12 +85,14 @@ final class DebugServerViewModel: ObservableObject {
             } catch {
                 result = .failure(error)
             }
+
             await MainActor.run {
                 self.busy = false
                 switch result {
                 case let .success(text):
                     self.output = text
-                    self.status = "\(text.split(separator: "\n").count) process(es)"
+                    let count = text.split(separator: "\n").count
+                    self.status = "\(count) process(es)"
                 case let .failure(error):
                     self.output = "✗ " + error.localizedDescription
                     self.status = "Failed"
@@ -233,42 +101,58 @@ final class DebugServerViewModel: ObservableObject {
         }
     }
 
-    /// Send a signal to a process on the device.
     func sendSignal() {
-        guard let pid = Int32(pid), let number = Int32(signal), !busy else { return }
+        guard let pidValue = Int32(pid),
+              let number = Int32(signal),
+              !busy else { return }
         busy = true
+
         Task.detached(priority: .userInitiated) {
             let result: Result<String, Error>
             do {
-                try JITEnableContext.shared.sendSignal(number, toProcessWithPID: pid)
-                result = .success("Sent signal \(number) to process \(pid).")
+                try JITEnableContext.shared.sendSignal(number, toProcessWithPID: pidValue)
+                result = .success("Sent signal \(number) to process \(pidValue).")
             } catch {
                 result = .failure(error)
             }
+
             await MainActor.run {
                 self.busy = false
-                self.output = (try? result.get()) ?? ""
-                self.status = result.map { _ in "Done" } ?? "Failed"
+                switch result {
+                case let .success(text):
+                    self.output = text
+                    self.status = "Done"
+                case let .failure(error):
+                    self.output = "✗ " + error.localizedDescription
+                    self.status = "Failed"
+                }
             }
         }
     }
 
-    /// Kill a process on the device.
     func killProcess() {
-        guard let pid = Int32(pid), !busy else { return }
+        guard let pidValue = Int32(pid), !busy else { return }
         busy = true
+
         Task.detached(priority: .userInitiated) {
             let result: Result<String, Error>
             do {
-                try JITEnableContext.shared.killProcess(withPID: pid)
-                result = .success("Killed process \(pid).")
+                try JITEnableContext.shared.killProcess(withPID: pidValue)
+                result = .success("Killed process \(pidValue).")
             } catch {
                 result = .failure(error)
             }
+
             await MainActor.run {
                 self.busy = false
-                self.output = (try? result.get()) ?? ""
-                self.status = result.map { _ in "Done" } ?? "Failed"
+                switch result {
+                case let .success(text):
+                    self.output = text
+                    self.status = "Done"
+                case let .failure(error):
+                    self.output = "✗ " + error.localizedDescription
+                    self.status = "Failed"
+                }
             }
         }
     }
@@ -328,8 +212,6 @@ struct DebugServerView: View {
                 }
             } header: {
                 Text("Command")
-            } footer: {
-                Text("Type a command and it runs on the device. With shell mode on, the text is sent as `platform shell <command>`; with it off, the text goes to the debug server verbatim.")
             }
 
             Section {
