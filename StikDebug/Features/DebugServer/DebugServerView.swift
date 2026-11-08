@@ -101,7 +101,11 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 defer { if let debugProxy { debug_proxy_free(debugProxy) } }
 
-                // 1. Отключаем ACK-режим, иначе platform shell зависает
+                // Шаг 1: два ACK, чтобы подтвердить handshake debug server
+                debug_proxy_send_ack(debugProxy)
+                debug_proxy_send_ack(debugProxy)
+
+                // Шаг 2: переключение в режим без ACK
                 if let ackCmd = debugserver_command_new("QStartNoAckMode", nil, 0) {
                     var ackResp: UnsafeMutablePointer<CChar>?
                     let ackErr = debug_proxy_send_command(debugProxy, ackCmd, &ackResp)
@@ -111,7 +115,7 @@ final class DebugServerViewModel: ObservableObject {
                     debug_proxy_set_ack_mode(debugProxy, 0)
                 }
 
-                // 2. Создаём и отправляем саму команду
+                // Шаг 3: сама команда
                 guard let commandHandle = debugserver_command_new(command, nil, 0) else {
                     throw NSError(
                         domain: "StikDebug",
@@ -135,30 +139,14 @@ final class DebugServerViewModel: ObservableObject {
                     )
                 }
 
-                var parts: [String] = []
+                // debug_proxy_send_command сам возвращает первый ответ.
+                // Никакого read_response — он блокируется (это для send_raw).
                 if let first {
-                    parts.append(String(cString: first))
+                    let text = String(cString: first)
                     idevice_string_free(first)
+                    return text
                 }
-
-                // 3. Читаем всё до конца (с ограничением на 512 итераций)
-                if collectAll {
-                    for _ in 0..<512 {
-                        var chunk: UnsafeMutablePointer<CChar>?
-                        if let readError = debug_proxy_read_response(debugProxy, &chunk) {
-                            if let chunk { idevice_string_free(chunk) }
-                            idevice_error_free(readError)
-                            break
-                        }
-                        guard let chunk else { break }
-                        let text = String(cString: chunk)
-                        idevice_string_free(chunk)
-                        if text.isEmpty { break }
-                        parts.append(text)
-                    }
-                }
-
-                return parts.joined()
+                return ""
             }
             return .success(response)
         } catch {
