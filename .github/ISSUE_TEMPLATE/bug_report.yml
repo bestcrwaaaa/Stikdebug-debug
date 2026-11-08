@@ -1,0 +1,83 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out the information below to help us fix it.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+      placeholder: Describe what happened...
+    validations:
+      required: true
+  - type: textarea
+    id: affected-app
+    attributes:
+      label: JIT - Affected App and IPA Source
+      description: If the issue involves enabling JIT for a particular app, name the app and tell us where you obtained its IPA. Include a download page or repository link if available.
+      placeholder: |
+        App name and version:
+        IPA source or link:
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Go to ...
+        2. Tap on ...
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: ios-version
+    attributes:
+      label: iOS / iPadOS Version
+      placeholder: e.g. 18.3.1
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: e.g. iPhone 15 Pro
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: StikDebug Version
+      placeholder: e.g. 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: livecontainer
+    attributes:
+      label: Are you running StikDebug inside LiveContainer?
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Any relevant logs from the app's log viewer.
+      render: shell
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: If applicable, add screenshots to help explain the issue.
