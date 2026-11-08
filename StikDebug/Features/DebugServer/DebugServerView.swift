@@ -254,6 +254,76 @@ private enum Tunnel {
             return try body(control, adapter, dataPort)
         }
     }
+
+    /// DVT FileService with explicit raw UInt32 domain + optional identifier.
+    /// `identifier == nil` → passes nil to create_session.
+    static func fileServiceRaw<T>(
+        domain: UInt32,
+        identifier: String?,
+        hostname: String = "StikDebugFSRaw",
+        _ body: (OpaquePointer, OpaquePointer, UInt16) throws -> T
+    ) throws -> T {
+        try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
+            var dataPort: UInt16 = 0
+            var services: UnsafeMutablePointer<CRsdServiceArray>?
+            if let e = rsd_get_services(handshake, &services) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "rsd_get_services: \(ideviceErrorString(e) ?? "?")"])
+            }
+            defer { if let services { rsd_free_services(services) } }
+            if let services {
+                let arr = services.pointee
+                for i in 0..<Int(arr.count) {
+                    let svc = arr.services[i]
+                    if let namePtr = svc.name,
+                       String(cString: namePtr) == "com.apple.coredevice.fileservice.data" {
+                        dataPort = svc.port
+                        break
+                    }
+                }
+            }
+            guard dataPort != 0 else {
+                throw NSError(domain: "StikDebug", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "fileservice.data port not found"])
+            }
+
+            var control: OpaquePointer?
+            if let e = file_service_connect_rsd(adapter, handshake, &control) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "file_service_connect_rsd: \(ideviceErrorString(e) ?? "?")"])
+            }
+            guard let control else {
+                throw NSError(domain: "StikDebug", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "file_service nil"])
+            }
+            defer { file_service_free(control) }
+
+            // Known enum cases → safe path. Arbitrary raw → bitcast (C enum ABI is UInt32).
+            let dom: IdeviceFileServiceDomain
+            if let d = IdeviceFileServiceDomain(rawValue: domain) {
+                dom = d
+            } else {
+                dom = unsafeBitCast(domain, to: IdeviceFileServiceDomain.self)
+            }
+
+            var sessionID: UnsafeMutablePointer<CChar>?
+            var createErr: UnsafeMutablePointer<IdeviceFfiError>?
+            if let ident = identifier {
+                createErr = ident.withCString { ptr in
+                    file_service_create_session(control, dom, ptr, &sessionID)
+                }
+            } else {
+                createErr = file_service_create_session(control, dom, nil, &sessionID)
+            }
+            if let ce = createErr {
+                throw NSError(domain: "StikDebug", code: Int(ce.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "create_session: \(ideviceErrorString(ce) ?? "?")"])
+            }
+            defer { if let sessionID { idevice_string_free(sessionID) } }
+
+            return try body(control, adapter, dataPort)
+        }
+    }
 }
 
 // MARK: - ViewModel
@@ -280,6 +350,12 @@ final class DebugServerViewModel: ObservableObject {
     @Published var longitude: String = "37.6173"
     @Published var notificationName: String = "com.apple.springboard.lockcomplete"
     @Published var mgKeys: String = "ProductType,ProductVersion,BuildVersion,UniqueDeviceID,SerialNumber,HWModel,CPUArchitecture,MarketingName"
+
+    // Raw DVT control (additive — existing fields untouched)
+    @Published var dvtDomainText: String = "5"
+    @Published var dvtIdentifierOverride: String = ""
+    @Published var dvtUseNilIdentifier: Bool = true
+    @Published var dvtPathRaw: String = "/var/mobile/Library/Logs/CrashReporter"
 
     // Process Control
     @Published var launchBundle: String = "com.apple.Preferences"
@@ -1448,6 +1524,38 @@ struct DebugServerView: View {
         btn("List directory (DVT)") { m.devDirListing() }
         btn("Read file (DVT)", color: .green) { m.readFileDVT() }
         btn("Create empty file (DVT)", color: .purple) { m.proposeEmptyFileDVT() }
+        Divider().padding(.vertical, 4)
+        Text("Advanced (raw domain + identifier)").font(.caption).foregroundStyle(.secondary)
+        HStack {
+            TextField("Domain #", text: $m.dvtDomainText)
+                .keyboardType(.numbersAndPunctuation)
+                .font(.system(.caption, design: .monospaced))
+                .textFieldStyle(.roundedBorder)
+            TextField("Identifier (override)", text: $m.dvtIdentifierOverride)
+                .font(.system(.caption, design: .monospaced))
+                .textFieldStyle(.roundedBorder)
+        }
+        Toggle("Pass nil identifier", isOn: $m.dvtUseNilIdentifier)
+            .font(.caption)
+        TextField("Path (raw)", text: $m.dvtPathRaw)
+            .font(.system(.caption, design: .monospaced))
+            .textFieldStyle(.roundedBorder)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(["0", "4", "6", "7"], id: \.self) { n in
+                    Button("dom=\(n)") { m.dvtDomainText = n }
+                        .font(.caption2).buttonStyle(.bordered)
+                }
+                ForEach(["/private/etc/hosts", "/private/etc/passwd",
+                         "/private/var/mobile/Library/Preferences"],
+                        id: \.self) { p in
+                    Button(p) { m.dvtPathRaw = p }
+                        .font(.caption2).buttonStyle(.bordered)
+                }
+            }
+        }
+        btn("Read file (DVT raw)", color: .green) { m.readFileDVTRaw() }
+        btn("Create empty (DVT raw)", color: .purple) { m.proposeEmptyFileDVTRaw() }
         Divider().padding(.vertical, 4)
         Text("AFC (own container only)").font(.caption).foregroundStyle(.secondary)
         btn("Read file (AFC)", color: .blue) { m.readFileAFC() }
