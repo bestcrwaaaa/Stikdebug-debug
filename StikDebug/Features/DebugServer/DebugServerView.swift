@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 /// The raw console for the device's debug server.
 ///
