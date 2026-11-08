@@ -94,8 +94,8 @@ final class DebugServerViewModel: ObservableObject {
                         elapsed,
                         text.utf8.count
                     )
-                case let .failure(message):
-                    self.output = "✗ " + message
+                case let .failure(error):
+                    self.output = "✗ " + error.localizedDescription
                     self.status = String(format: "Failed after %.2fs", elapsed)
                 }
             }
@@ -109,7 +109,7 @@ final class DebugServerViewModel: ObservableObject {
     /// same way, which is why nothing here is filtered. When `collectAll` is
     /// set the channel is read until the device closes it, so the full output
     /// arrives instead of the first response.
-    private static func send(_ command: String, collectAll: Bool) -> Result<String, String> {
+    private static func send(_ command: String, collectAll: Bool) -> Result<String, Error> {
         do {
             let response = try JITEnableContext.shared.withFreshDebugTunnel(
                 hostname: "StikDebugDebugServer"
@@ -171,7 +171,7 @@ final class DebugServerViewModel: ObservableObject {
             }
             return .success(response)
         } catch {
-            return .failure(error.localizedDescription)
+            return .failure(error)
         }
     }
 
@@ -204,7 +204,7 @@ final class DebugServerViewModel: ObservableObject {
         busy = true
         status = "Listing processes…"
         Task.detached(priority: .userInitiated) {
-            let result: Result<String, String>
+            let result: Result<String, Error>
             do {
                 let processes = try JITEnableContext.shared.fetchProcessList()
                 let text = processes
@@ -217,7 +217,7 @@ final class DebugServerViewModel: ObservableObject {
                     .joined(separator: "\n")
                 result = .success(text)
             } catch {
-                result = .failure(error.localizedDescription)
+                result = .failure(error)
             }
             await MainActor.run {
                 self.busy = false
@@ -225,8 +225,8 @@ final class DebugServerViewModel: ObservableObject {
                 case let .success(text):
                     self.output = text
                     self.status = "\(text.split(separator: "\n").count) process(es)"
-                case let .failure(message):
-                    self.output = "✗ " + message
+                case let .failure(error):
+                    self.output = "✗ " + error.localizedDescription
                     self.status = "Failed"
                 }
             }
@@ -238,12 +238,12 @@ final class DebugServerViewModel: ObservableObject {
         guard let pid = Int32(pid), let number = Int32(signal), !busy else { return }
         busy = true
         Task.detached(priority: .userInitiated) {
-            let result: Result<String, String>
+            let result: Result<String, Error>
             do {
                 try JITEnableContext.shared.sendSignal(number, toProcessWithPID: pid)
                 result = .success("Sent signal \(number) to process \(pid).")
             } catch {
-                result = .failure(error.localizedDescription)
+                result = .failure(error)
             }
             await MainActor.run {
                 self.busy = false
@@ -258,12 +258,12 @@ final class DebugServerViewModel: ObservableObject {
         guard let pid = Int32(pid), !busy else { return }
         busy = true
         Task.detached(priority: .userInitiated) {
-            let result: Result<String, String>
+            let result: Result<String, Error>
             do {
                 try JITEnableContext.shared.killProcess(withPID: pid)
                 result = .success("Killed process \(pid).")
             } catch {
-                result = .failure(error.localizedDescription)
+                result = .failure(error)
             }
             await MainActor.run {
                 self.busy = false
