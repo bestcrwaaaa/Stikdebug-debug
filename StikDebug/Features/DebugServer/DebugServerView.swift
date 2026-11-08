@@ -615,15 +615,8 @@ final class DebugServerViewModel: ObservableObject {
     // MARK: Apps
 
     func appList() {
-        run("Listing apps…") {
-            try Tunnel.remoteServer { server in
-                var h: OpaquePointer?
-                if let e = app_service_connect_rsd(server == nil ? nil : server, nil, nil) {
-                    _ = e; // fallback not supported here
-                }
-                return "not implemented in this build"
-            }
-        }
+        output = "AppService listing not implemented here. Use Browse installed apps (InstallationProxy)."
+        status = "Not available"
     }
 
     func appListViaInstallationProxy() {
@@ -707,7 +700,7 @@ final class DebugServerViewModel: ObservableObject {
                 config.process_attributes = nil
                 config.process_attributes_count = 0
                 config.system_attributes = systemAttrs.withUnsafeBufferPointer { $0.baseAddress }
-                config.system_attributes_count = systemAttrs.count
+                config.system_attributes_count = UInt(systemAttrs.count)
 
                 if let e = sysmontap_set_config(h, &config) {
                     throw NSError(domain: "cfg", code: Int(e.pointee.code),
@@ -800,7 +793,7 @@ extension Array where Element == String {
         if isEmpty { return body(nil, 0) }
         let cStrings = map { strdup($0) }
         defer { cStrings.forEach { free($0) } }
-        var ptrs: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
+        let ptrs: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
         return ptrs.withUnsafeBufferPointer { buf in
             body(buf.baseAddress, UInt(ptrs.count))
         }
