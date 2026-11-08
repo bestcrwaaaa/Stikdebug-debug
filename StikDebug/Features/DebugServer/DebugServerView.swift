@@ -7,21 +7,19 @@ import SwiftUI
 import UIKit
 import idevice
 
-// MARK: - plist helpers
+// MARK: - helpers
 
 private func plistToString(_ plist: UnsafeMutableRawPointer?) -> String {
     guard let plist else { return "<nil>" }
     var xml: UnsafeMutablePointer<CChar>?
     var len: UInt32 = 0
     let err = plist_to_xml(plist, &xml, &len)
-    defer { if let xml { plist_mem_free(xml) } }
-    guard err == PLIST_ERR_SUCCESS, let xml else { return "<plist err \(err.rawValue)>" }
+    defer { if let xml { plist_mem_free(UnsafeMutableRawPointer(xml)) } }
+    guard err.rawValue == 0, let xml else { return "<plist err \(err.rawValue)>" }
     return String(cString: xml)
 }
 
-private func freePlist(_ plist: UnsafeMutableRawPointer?) {
-    if let plist { plist_free(plist) }
-}
+private func freePlist(_ p: UnsafeMutableRawPointer?) { if let p { plist_free(p) } }
 
 private func ideviceErrorString(_ err: UnsafeMutablePointer<IdeviceFfiError>?) -> String? {
     guard let err else { return nil }
@@ -30,17 +28,25 @@ private func ideviceErrorString(_ err: UnsafeMutablePointer<IdeviceFfiError>?) -
     return msg
 }
 
-// MARK: - Service tunnels
+private func makeFileDomain(_ raw: Int) -> IdeviceFileServiceDomain {
+    IdeviceFileServiceDomain(rawValue: UInt32(raw)) ?? IdeviceFileServiceDomainSystemCrashLogs
+}
+
+private func previewBytes(_ data: Data) -> String {
+    if let text = String(data: data.prefix(65536), encoding: .utf8) { return text }
+    return data.prefix(4096).map { String(format: "%02x", $0) }.joined()
+}
+
+// MARK: - tunnels
 
 private enum Tunnel {
     static func remoteServer<T>(hostname: String = "StikDebugRemoteServer",
                                 _ body: (OpaquePointer) throws -> T) throws -> T {
         try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
             var server: OpaquePointer?
-            if let err = remote_server_connect_rsd(adapter, handshake, &server) {
-                throw NSError(domain: "StikDebug", code: Int(err.pointee.code),
-                              userInfo: [NSLocalizedDescriptionKey:
-                                "remote_server: \(ideviceErrorString(err) ?? "?")"])
+            if let e = remote_server_connect_rsd(adapter, handshake, &server) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "remote_server: \(ideviceErrorString(e) ?? "?")"])
             }
             guard let server else {
                 throw NSError(domain: "StikDebug", code: -1,
@@ -55,14 +61,12 @@ private enum Tunnel {
                                _ body: (OpaquePointer) throws -> T) throws -> T {
         try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
             var client: OpaquePointer?
-            if let err = diagnostics_relay_client_connect_rsd(adapter, handshake, &client) {
-                throw NSError(domain: "StikDebug", code: Int(err.pointee.code),
-                              userInfo: [NSLocalizedDescriptionKey:
-                                "diagnostics: \(ideviceErrorString(err) ?? "?")"])
+            if let e = diagnostics_relay_client_connect_rsd(adapter, handshake, &client) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "diagnostics: \(ideviceErrorString(e) ?? "?")"])
             }
             guard let client else {
-                throw NSError(domain: "StikDebug", code: -1,
-                              userInfo: [NSLocalizedDescriptionKey: "diagnostics nil"])
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "diagnostics nil"])
             }
             defer { diagnostics_relay_client_free(client) }
             return try body(client)
@@ -73,14 +77,12 @@ private enum Tunnel {
                           _ body: (OpaquePointer) throws -> T) throws -> T {
         try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
             var client: OpaquePointer?
-            if let err = configuration_service_connect_rsd(adapter, handshake, &client) {
-                throw NSError(domain: "StikDebug", code: Int(err.pointee.code),
-                              userInfo: [NSLocalizedDescriptionKey:
-                                "config: \(ideviceErrorString(err) ?? "?")"])
+            if let e = configuration_service_connect_rsd(adapter, handshake, &client) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "config: \(ideviceErrorString(e) ?? "?")"])
             }
             guard let client else {
-                throw NSError(domain: "StikDebug", code: -1,
-                              userInfo: [NSLocalizedDescriptionKey: "config nil"])
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "config nil"])
             }
             defer { configuration_service_free(client) }
             return try body(client)
@@ -91,14 +93,12 @@ private enum Tunnel {
                                      _ body: (OpaquePointer) throws -> T) throws -> T {
         try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
             var client: OpaquePointer?
-            if let err = notification_proxy_connect_rsd(adapter, handshake, &client) {
-                throw NSError(domain: "StikDebug", code: Int(err.pointee.code),
-                              userInfo: [NSLocalizedDescriptionKey:
-                                "notif: \(ideviceErrorString(err) ?? "?")"])
+            if let e = notification_proxy_connect_rsd(adapter, handshake, &client) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "notif: \(ideviceErrorString(e) ?? "?")"])
             }
             guard let client else {
-                throw NSError(domain: "StikDebug", code: -1,
-                              userInfo: [NSLocalizedDescriptionKey: "notif nil"])
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "notif nil"])
             }
             defer { notification_proxy_client_free(client) }
             return try body(client)
@@ -109,17 +109,99 @@ private enum Tunnel {
                                _ body: (OpaquePointer) throws -> T) throws -> T {
         try remoteServer(hostname: hostname) { server in
             var client: OpaquePointer?
-            if let err = location_simulation_new(server, &client) {
-                throw NSError(domain: "StikDebug", code: Int(err.pointee.code),
-                              userInfo: [NSLocalizedDescriptionKey:
-                                "location: \(ideviceErrorString(err) ?? "?")"])
+            if let e = location_simulation_new(server, &client) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "location: \(ideviceErrorString(e) ?? "?")"])
             }
             guard let client else {
-                throw NSError(domain: "StikDebug", code: -1,
-                              userInfo: [NSLocalizedDescriptionKey: "location nil"])
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "location nil"])
             }
             defer { location_simulation_free(client) }
             return try body(client)
+        }
+    }
+
+    /// HouseArrest → AFC for a given app bundle. Returns the AFC client to body.
+    static func houseArrest<T>(bundleID: String, hostname: String = "StikDebugHA",
+                               _ body: (OpaquePointer) throws -> T) throws -> T {
+        try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
+            var ha: OpaquePointer?
+            if let e = house_arrest_client_connect_rsd(adapter, handshake, &ha) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "house_arrest: \(ideviceErrorString(e) ?? "?")"])
+            }
+            guard let ha else {
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "ha nil"])
+            }
+            defer { house_arrest_client_free(ha) }
+
+            var afc: OpaquePointer?
+            let vendErr = bundleID.withCString { house_arrest_vend_documents(ha, $0, &afc) }
+            if let vendErr {
+                throw NSError(domain: "StikDebug", code: Int(vendErr.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "vend_documents: \(ideviceErrorString(vendErr) ?? "?")"])
+            }
+            guard let afc else {
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "afc nil"])
+            }
+            defer { afc_client_free(afc) }
+            return try body(afc)
+        }
+    }
+
+    /// DVT FileService: gives control channel, adapter, data port.
+    static func fileService<T>(domain rawDomain: Int, bundleID: String, hostname: String = "StikDebugFS",
+                               _ body: (OpaquePointer, OpaquePointer, UInt16) throws -> T) throws -> T {
+        try JITEnableContext.shared.withFreshDebugTunnel(hostname: hostname) { adapter, handshake in
+            // 1. find data port
+            var dataPort: UInt16 = 0
+            var services: UnsafeMutablePointer<CRsdServiceArray>?
+            if let e = rsd_get_services(handshake, &services) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "rsd_get_services: \(ideviceErrorString(e) ?? "?")"])
+            }
+            defer { if let services { rsd_free_services(services) } }
+            if let services {
+                let arr = services.pointee
+                for i in 0..<Int(arr.count) {
+                    let svc = arr.services[i]
+                    if let namePtr = svc.name,
+                       String(cString: namePtr) == "com.apple.coredevice.fileservice.data" {
+                        dataPort = svc.port
+                        break
+                    }
+                }
+            }
+            guard dataPort != 0 else {
+                throw NSError(domain: "StikDebug", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "fileservice.data port not found"])
+            }
+
+            // 2. control channel
+            var control: OpaquePointer?
+            if let e = file_service_connect_rsd(adapter, handshake, &control) {
+                throw NSError(domain: "StikDebug", code: Int(e.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "file_service_connect_rsd: \(ideviceErrorString(e) ?? "?")"])
+            }
+            guard let control else {
+                throw NSError(domain: "StikDebug", code: -1, userInfo: [NSLocalizedDescriptionKey: "file_service nil"])
+            }
+            defer { file_service_free(control) }
+
+            // 3. session
+            let domain = makeFileDomain(rawDomain)
+            let needsIdent = (domain.rawValue == 1 || domain.rawValue == 2)
+            var sessionID: UnsafeMutablePointer<CChar>?
+            let createErr = bundleID.withCString { bid in
+                file_service_create_session(control, domain, needsIdent ? bid : nil, &sessionID)
+            }
+            if let createErr {
+                throw NSError(domain: "StikDebug", code: Int(createErr.pointee.code),
+                              userInfo: [NSLocalizedDescriptionKey: "create_session: \(ideviceErrorString(createErr) ?? "?")"])
+            }
+            defer { if let sessionID { idevice_string_free(sessionID) } }
+
+            return try body(control, adapter, dataPort)
         }
     }
 }
@@ -133,37 +215,28 @@ final class DebugServerViewModel: ObservableObject {
     @Published var status: String = ""
     @Published var busy = false
 
-    // raw command
     @Published var command: String = "QStartNoAckMode"
     @Published var shellMode = false
     @Published var history: [String] = []
 
-    // args
     @Published var pid: String = ""
     @Published var signal: String = "15"
-    @Published var bundleID: String = "com.apple.mobilesafari"
-    @Published var filePath: String = "/"
+    @Published var bundleID: String = "com.stik.stikdebug"
+    @Published var filePath: String = "/var/mobile/Library/Logs/CrashReporter"
+    @Published var fileContent: String = ""
+    @Published var dvtDomainRaw: Int = 5    // 1 AppData, 2 AppGroup, 3 Temporary, 5 CrashLogs
     @Published var latitude: String = "55.7558"
     @Published var longitude: String = "37.6173"
     @Published var notificationName: String = "com.apple.springboard.lockcomplete"
     @Published var mgKeys: String = "ProductType,ProductVersion,BuildVersion,UniqueDeviceID,SerialNumber,HWModel,CPUArchitecture,MarketingName"
-    @Published var textInput: String = "Hello"
 
-    private func start(_ label: String) {
-        busy = true
-        status = label
-        output = ""
-    }
+    private func start(_ label: String) { busy = true; status = label; output = "" }
 
-    private func finish(_ result: Result<String, Error>) {
+    private func finish(_ r: Result<String, Error>) {
         busy = false
-        switch result {
-        case let .success(text):
-            output = text
-            status = "Done · \(text.utf8.count) byte(s)"
-        case let .failure(err):
-            output = "✗ " + err.localizedDescription
-            status = "Failed"
+        switch r {
+        case .success(let t): output = t; status = "Done · \(t.utf8.count) byte(s)"
+        case .failure(let e): output = "✗ \(e.localizedDescription)"; status = "Failed"
         }
     }
 
@@ -193,8 +266,8 @@ final class DebugServerViewModel: ObservableObject {
             await MainActor.run {
                 self.busy = false
                 switch r {
-                case let .success(t): self.output = t; self.status = "OK"
-                case let .failure(e): self.output = "✗ \(e.localizedDescription)"; self.status = "Failed"
+                case .success(let t): self.output = t; self.status = "OK"
+                case .failure(let e): self.output = "✗ \(e.localizedDescription)"; self.status = "Failed"
                 }
             }
         }
@@ -242,14 +315,15 @@ final class DebugServerViewModel: ObservableObject {
     func diagMobileGestalt() {
         let keys = mgKeys.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         run("MobileGestalt…") {
-            try Tunnel.diagnostics { client in
+            try Tunnel.diagnostics { c in
                 var plist: UnsafeMutableRawPointer?
-                let r: Int32 = keys.withCStringArray { arr, count in
-                    let e = diagnostics_relay_client_mobilegestalt(client, arr, count, &plist)
-                    return e == nil ? 0 : 1
+                var cKeys: [UnsafePointer<CChar>?] = keys.map { strdup($0).map { UnsafePointer($0) } }
+                defer { cKeys.forEach { if let p = $0 { free(UnsafeMutablePointer(mutating: p)) } } }
+                let arrPtr = cKeys.withUnsafeBufferPointer { $0.baseAddress }
+                if let e = diagnostics_relay_client_mobilegestalt(c, arrPtr, UInt(cKeys.count), &plist) {
+                    throw NSError(domain: "mg", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                if r != 0 { throw NSError(domain: "mg", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "mobilegestalt failed"]) }
                 defer { freePlist(plist) }
                 return plistToString(plist)
             }
@@ -259,13 +333,13 @@ final class DebugServerViewModel: ObservableObject {
     func diagAll() {
         run("DiagnosticsRelay.all…") {
             try Tunnel.diagnostics { c in
-                var plist: UnsafeMutableRawPointer?
-                if let e = diagnostics_relay_client_all(c, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = diagnostics_relay_client_all(c, &p) {
                     throw NSError(domain: "all", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -273,13 +347,13 @@ final class DebugServerViewModel: ObservableObject {
     func diagIoRegistry() {
         run("IO Registry…") {
             try Tunnel.diagnostics { c in
-                var plist: UnsafeMutableRawPointer?
-                if let e = diagnostics_relay_client_ioregistry(c, nil, nil, nil, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = diagnostics_relay_client_ioregistry(c, nil, nil, nil, &p) {
                     throw NSError(domain: "ior", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -287,13 +361,13 @@ final class DebugServerViewModel: ObservableObject {
     func diagGasGauge() {
         run("GasGauge…") {
             try Tunnel.diagnostics { c in
-                var plist: UnsafeMutableRawPointer?
-                if let e = diagnostics_relay_client_gasguage(c, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = diagnostics_relay_client_gasguage(c, &p) {
                     throw NSError(domain: "gg", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -301,13 +375,13 @@ final class DebugServerViewModel: ObservableObject {
     func diagNand() {
         run("NAND…") {
             try Tunnel.diagnostics { c in
-                var plist: UnsafeMutableRawPointer?
-                if let e = diagnostics_relay_client_nand(c, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = diagnostics_relay_client_nand(c, &p) {
                     throw NSError(domain: "nand", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -315,13 +389,13 @@ final class DebugServerViewModel: ObservableObject {
     func diagWifi() {
         run("WiFi…") {
             try Tunnel.diagnostics { c in
-                var plist: UnsafeMutableRawPointer?
-                if let e = diagnostics_relay_client_wifi(c, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = diagnostics_relay_client_wifi(c, &p) {
                     throw NSError(domain: "wifi", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -382,12 +456,12 @@ final class DebugServerViewModel: ObservableObject {
     func configGetStyle() {
         run("Get UI style…") {
             try Tunnel.config { c in
-                var style: IdeviceUserInterfaceStyle = IdeviceUserInterfaceStyleLight
-                if let e = configuration_service_get_user_interface_style(c, &style) {
+                var s: IdeviceUserInterfaceStyle = IdeviceUserInterfaceStyleLight
+                if let e = configuration_service_get_user_interface_style(c, &s) {
                     throw NSError(domain: "cfg", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                return "style: \(style == IdeviceUserInterfaceStyleDark ? "Dark" : "Light")"
+                return "style: \(s.rawValue == 1 ? "Dark" : "Light")"
             }
         }
     }
@@ -431,7 +505,7 @@ final class DebugServerViewModel: ObservableObject {
     func configSetTextSize(_ size: String) {
         run("Text size \(size)…") {
             try Tunnel.config { c in
-                if let e = configuration_service_set_device_text_size(c, size) {
+                if let e = size.withCString({ configuration_service_set_device_text_size(c, $0) }) {
                     throw NSError(domain: "cfg", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
@@ -476,7 +550,7 @@ final class DebugServerViewModel: ObservableObject {
         guard !n.isEmpty else { return }
         run("Post \(n)…") {
             try Tunnel.notificationProxy { c in
-                if let e = notification_proxy_post(c, n) {
+                if let e = n.withCString({ notification_proxy_post(c, $0) }) {
                     throw NSError(domain: "ntf", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
@@ -497,13 +571,13 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 guard let h else { throw NSError(domain: "di", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
                 defer { device_info_free(h) }
-                var plist: UnsafeMutableRawPointer?
-                if let e = device_info_hardware_information(h, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = device_info_hardware_information(h, &p) {
                     throw NSError(domain: "hw", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -518,13 +592,13 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 guard let h else { throw NSError(domain: "di", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
                 defer { device_info_free(h) }
-                var plist: UnsafeMutableRawPointer?
-                if let e = device_info_network_information(h, &plist) {
+                var p: UnsafeMutableRawPointer?
+                if let e = device_info_network_information(h, &p) {
                     throw NSError(domain: "nw", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
-                defer { freePlist(plist) }
-                return plistToString(plist)
+                defer { freePlist(p) }
+                return plistToString(p)
             }
         }
     }
@@ -567,7 +641,7 @@ final class DebugServerViewModel: ObservableObject {
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
                 defer { if let procs { device_info_running_processes_free(procs, count) } }
-                var lines: [String] = ["pid\tname\tapp\tpath"]
+                var lines: [String] = ["pid\tname\ttype"]
                 if let procs {
                     for i in 0..<Int(count) {
                         guard let p = procs[i] else { continue }
@@ -581,6 +655,8 @@ final class DebugServerViewModel: ObservableObject {
             }
         }
     }
+
+    // MARK: Files (DVT)
 
     func devDirListing() {
         let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -596,7 +672,7 @@ final class DebugServerViewModel: ObservableObject {
                 defer { device_info_free(h) }
                 var entries: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
                 var count: UInt = 0
-                if let e = device_info_directory_listing(h, path, &entries, &count) {
+                if let e = path.withCString({ device_info_directory_listing(h, $0, &entries, &count) }) {
                     throw NSError(domain: "ls", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
@@ -607,7 +683,114 @@ final class DebugServerViewModel: ObservableObject {
                         if let p = entries[i] { out.append(String(cString: p)) }
                     }
                 }
-                return out.joined(separator: "\n")
+                return out.isEmpty ? "<empty>" : out.joined(separator: "\n")
+            }
+        }
+    }
+
+    func readFileDVT() {
+        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { output = "✗ empty path"; return }
+        let domainRaw = dvtDomainRaw
+        let bundle = bundleID
+        run("DVT read \(path)…") {
+            try Tunnel.fileService(domain: domainRaw, bundleID: bundle) { control, adapter, dataPort in
+                var data: UnsafeMutablePointer<UInt8>?
+                var len: UInt = 0
+                if let e = path.withCString({ file_service_retrieve_file(control, $0, adapter, dataPort, &data, &len) }) {
+                    throw NSError(domain: "fs", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "retrieve_file: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let data { idevice_data_free(data, len) } }
+                guard let data, len > 0 else { return "<empty>" }
+                let raw = Data(bytes: data, count: Int(len))
+                return previewBytes(raw)
+            }
+        }
+    }
+
+    func proposeEmptyFileDVT() {
+        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { output = "✗ empty path"; return }
+        let domainRaw = dvtDomainRaw
+        let bundle = bundleID
+        run("DVT create \(path)…") {
+            try Tunnel.fileService(domain: domainRaw, bundleID: bundle) { control, _, _ in
+                let now = Int64(Date().timeIntervalSince1970)
+                if let e = path.withCString({
+                    file_service_propose_empty_file(control, $0, 0o644, 501, 501, now, now)
+                }) {
+                    throw NSError(domain: "fs", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "propose: \(ideviceErrorString(e) ?? "?")"])
+                }
+                return "OK — file created"
+            }
+        }
+    }
+
+    // MARK: Files (AFC, own container)
+
+    func readFileAFC() {
+        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { output = "✗ empty path"; return }
+        let bundle = bundleID
+        run("AFC read \(path)…") {
+            try Tunnel.houseArrest(bundleID: bundle) { afc in
+                var fh: OpaquePointer?
+                if let e = path.withCString({ afc_file_open(afc, $0, AfcRdOnly, &fh) }) {
+                    throw NSError(domain: "afc", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "open: \(ideviceErrorString(e) ?? "?")"])
+                }
+                guard let fh else { throw NSError(domain: "afc", code: -1, userInfo: [NSLocalizedDescriptionKey: "fh nil"]) }
+                defer { _ = afc_file_close(fh) }
+
+                var dataPtr: UnsafeMutablePointer<UInt8>?
+                var len: Int = 0
+                if let e = afc_file_read_entire(fh, &dataPtr, &len) {
+                    throw NSError(domain: "afc", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "read: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let dataPtr { afc_file_read_data_free(dataPtr, len) } }
+                guard let dataPtr, len > 0 else { return "<empty>" }
+                return previewBytes(Data(bytes: dataPtr, count: len))
+            }
+        }
+    }
+
+    func writeFileAFC() {
+        let path = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { output = "✗ empty path"; return }
+        let bundle = bundleID
+        let content = fileContent
+        run("AFC write \(path)…") {
+            try Tunnel.houseArrest(bundleID: bundle) { afc in
+                var fh: OpaquePointer?
+                // try write-only first; if file exists it works
+                if let e = path.withCString({ afc_file_open(afc, $0, AfcWr, &fh) }) {
+                    idevice_error_free(e)
+                    fh = nil
+                    // try create (AfcWrOnly creates if missing)
+                    if let e2 = path.withCString({ afc_file_open(afc, $0, AfcWrOnly, &fh) }) {
+                        throw NSError(domain: "afc", code: Int(e2.pointee.code),
+                                      userInfo: [NSLocalizedDescriptionKey: "open: \(ideviceErrorString(e2) ?? "?")"])
+                    }
+                }
+                guard let fh else { throw NSError(domain: "afc", code: -1, userInfo: [NSLocalizedDescriptionKey: "fh nil"]) }
+                defer { _ = afc_file_close(fh) }
+
+                let data = Data(content.utf8)
+                if data.isEmpty { return "OK — empty write" }
+
+                var writeErr: UnsafeMutablePointer<IdeviceFfiError>?
+                data.withUnsafeBytes { rawBuf in
+                    let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                    writeErr = afc_file_write(fh, ptr, data.count)
+                }
+                if let writeErr {
+                    throw NSError(domain: "afc", code: Int(writeErr.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "write: \(ideviceErrorString(writeErr) ?? "?")"])
+                }
+                return "OK — wrote \(data.count) bytes"
             }
         }
     }
@@ -615,11 +798,6 @@ final class DebugServerViewModel: ObservableObject {
     // MARK: Apps
 
     func appList() {
-        output = "AppService listing not implemented here. Use Browse installed apps (InstallationProxy)."
-        status = "Not available"
-    }
-
-    func appListViaInstallationProxy() {
         run("InstallationProxy browse…") {
             try JITEnableContext.shared.withFreshDebugTunnel(hostname: "StikDebugInstProxy") { adapter, handshake in
                 var client: OpaquePointer?
@@ -637,9 +815,7 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 var out: [String] = []
                 if let result {
-                    for i in 0..<count {
-                        out.append(plistToString(result[i]))
-                    }
+                    for i in 0..<count { out.append(plistToString(result[i])) }
                 }
                 return out.joined(separator: "\n---\n")
             }
@@ -651,10 +827,10 @@ final class DebugServerViewModel: ObservableObject {
     func listProcesses() {
         run("List processes…") {
             let procs = try JITEnableContext.shared.fetchProcessList()
-            return procs.map { entry -> String in
-                let name = (entry["name"] as? String) ?? "?"
-                let pid = (entry["pid"] as? Int) ?? 0
-                let path = (entry["executablePath"] as? String) ?? ""
+            return procs.map { e -> String in
+                let name = (e["name"] as? String) ?? "?"
+                let pid = (e["pid"] as? Int) ?? 0
+                let path = (e["executablePath"] as? String) ?? ""
                 return "\(pid)\t\(name)\t\(path)"
             }.joined(separator: "\n")
         }
@@ -689,18 +865,17 @@ final class DebugServerViewModel: ObservableObject {
                 guard let h else { throw NSError(domain: "smt", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
                 defer { sysmontap_free(h) }
 
-                var systemAttrs: [UnsafePointer<CChar>?] = []
-                let systemNames = ["cpu_usage", "phys_footprint", "vm_pages"]
-                let cStrs = systemNames.map { strdup($0) }
-                defer { cStrs.forEach { free($0) } }
-                for c in cStrs { systemAttrs.append(c) }
+                let names = ["cpu_usage", "phys_footprint", "vm_pages"]
+                var cStrs: [UnsafeMutablePointer<CChar>?] = names.map { strdup($0) }
+                defer { cStrs.forEach { if let p = $0 { free(p) } } }
+                var ptrs: [UnsafePointer<CChar>?] = cStrs.map { $0.map { UnsafePointer($0) } }
 
                 var config = IdeviceSysmontapConfig()
                 config.interval_ms = 500
                 config.process_attributes = nil
                 config.process_attributes_count = 0
-                config.system_attributes = systemAttrs.withUnsafeBufferPointer { $0.baseAddress }
-                config.system_attributes_count = UInt(systemAttrs.count)
+                config.system_attributes = ptrs.withUnsafeBufferPointer { $0.baseAddress }
+                config.system_attributes_count = UInt(ptrs.count)
 
                 if let e = sysmontap_set_config(h, &config) {
                     throw NSError(domain: "cfg", code: Int(e.pointee.code),
@@ -735,7 +910,6 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 guard let h else { throw NSError(domain: "en", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
                 defer { energy_monitor_free(h) }
-
                 var samples: UnsafeMutablePointer<IdeviceEnergySample>?
                 var count: UInt = 0
                 if let e = energy_monitor_sample_attributes(h, nil, 0, &samples, &count) {
@@ -765,13 +939,11 @@ final class DebugServerViewModel: ObservableObject {
                 }
                 guard let h else { throw NSError(domain: "gr", code: -1, userInfo: [NSLocalizedDescriptionKey: "nil"]) }
                 defer { graphics_free(h) }
-
                 if let e = graphics_start_sampling(h, 1.0) {
                     throw NSError(domain: "start", code: Int(e.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: ideviceErrorString(e) ?? "?"])
                 }
                 defer { _ = graphics_stop_sampling(h) }
-
                 var sample: UnsafeMutablePointer<IdeviceGraphicsSample>?
                 if let e = graphics_next_sample(h, &sample) {
                     throw NSError(domain: "next", code: Int(e.pointee.code),
@@ -782,20 +954,6 @@ final class DebugServerViewModel: ObservableObject {
                 let gpu = s.pointee.gpu_bundle_name.map { String(cString: $0) } ?? "?"
                 return "fps=\(s.pointee.fps)\ngpu=\(gpu)\nalloc=\(s.pointee.alloc_system_memory)\ninuse=\(s.pointee.in_use_system_memory)"
             }
-        }
-    }
-}
-
-// MARK: - CString array helper
-
-extension Array where Element == String {
-    func withCStringArray<R>(_ body: (UnsafePointer<UnsafePointer<CChar>?>?, UInt) -> R) -> R {
-        if isEmpty { return body(nil, 0) }
-        let cStrings = map { strdup($0) }
-        defer { cStrings.forEach { free($0) } }
-        let ptrs: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
-        return ptrs.withUnsafeBufferPointer { buf in
-            body(buf.baseAddress, UInt(ptrs.count))
         }
     }
 }
@@ -825,11 +983,8 @@ struct DebugServerView: View {
             .padding(.horizontal, 4)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    content
-                }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
+                VStack(alignment: .leading, spacing: 8) { content }
+                    .padding(.horizontal, 12).padding(.top, 8)
             }
 
             outputPanel
@@ -861,8 +1016,7 @@ struct DebugServerView: View {
         TextField("command", text: $m.command, axis: .vertical)
             .font(.system(.body, design: .monospaced))
             .textInputAutocapitalization(.never).autocorrectionDisabled()
-            .lineLimit(1...4)
-            .textFieldStyle(.roundedBorder)
+            .lineLimit(1...4).textFieldStyle(.roundedBorder)
         Toggle("Shell mode (platform shell)", isOn: $m.shellMode)
         btn("Run command") { m.runRawCommand() }
         ForEach(m.history.prefix(5), id: \.self) { h in
@@ -873,8 +1027,7 @@ struct DebugServerView: View {
 
     @ViewBuilder private var systemTab: some View {
         TextField("MobileGestalt keys (comma-separated)", text: $m.mgKeys)
-            .font(.system(.caption, design: .monospaced))
-            .textFieldStyle(.roundedBorder)
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
         btn("MobileGestalt") { m.diagMobileGestalt() }
         btn("DiagnosticsRelay.all") { m.diagAll() }
         btn("IO Registry") { m.diagIoRegistry() }
@@ -923,8 +1076,7 @@ struct DebugServerView: View {
 
     @ViewBuilder private var notifTab: some View {
         TextField("Notification name", text: $m.notificationName)
-            .font(.system(.caption, design: .monospaced))
-            .textFieldStyle(.roundedBorder)
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
         btn("Post notification") { m.postNotification() }
         ScrollView(.horizontal) {
             HStack {
@@ -949,32 +1101,57 @@ struct DebugServerView: View {
     }
 
     @ViewBuilder private var filesTab: some View {
+        TextField("Bundle ID (for AFC / App domain)", text: $m.bundleID)
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
+
         TextField("Path", text: $m.filePath)
-            .font(.system(.caption, design: .monospaced))
-            .textFieldStyle(.roundedBorder)
-        btn("List directory") { m.devDirListing() }
-        ScrollView(.horizontal) {
+            .font(.system(.caption, design: .monospaced)).textFieldStyle(.roundedBorder)
+
+        ScrollView(.horizontal, showsIndicators: false) {
             HStack {
                 ForEach(["/", "/var/mobile", "/var/mobile/Media",
+                         "/var/mobile/Library/Logs/CrashReporter",
                          "/var/containers/Bundle/Application",
-                         "/var/mobile/Library"], id: \.self) { p in
+                         "/private/etc"], id: \.self) { p in
                     Button(p) { m.filePath = p }
                         .font(.caption2).buttonStyle(.bordered)
                 }
             }
         }
+
+        // DVT
+        HStack {
+            Text("DVT domain:").font(.caption).foregroundStyle(.secondary)
+            Picker("", selection: $m.dvtDomainRaw) {
+                Text("AppData").tag(1)
+                Text("AppGroup").tag(2)
+                Text("Temp").tag(3)
+                Text("CrashLogs").tag(5)
+            }.pickerStyle(.segmented)
+        }
+        btn("List directory (DVT)") { m.devDirListing() }
+        btn("Read file (DVT)", color: .green) { m.readFileDVT() }
+        btn("Create empty file (DVT)", color: .purple) { m.proposeEmptyFileDVT() }
+
+        // AFC
+        Divider().padding(.vertical, 4)
+        Text("AFC (own container only)").font(.caption).foregroundStyle(.secondary)
+        btn("Read file (AFC)", color: .blue) { m.readFileAFC() }
+        TextField("Content to write (AFC)", text: $m.fileContent, axis: .vertical)
+            .font(.system(.caption, design: .monospaced))
+            .textFieldStyle(.roundedBorder)
+            .lineLimit(2...6)
+        btn("Write file (AFC)", color: .orange) { m.writeFileAFC() }
     }
 
     @ViewBuilder private var appsTab: some View {
-        btn("Browse installed apps (InstallationProxy)") { m.appListViaInstallationProxy() }
+        btn("Browse installed apps") { m.appList() }
     }
 
     @ViewBuilder private var procTab: some View {
         HStack {
-            TextField("PID", text: $m.pid).keyboardType(.numberPad)
-                .textFieldStyle(.roundedBorder)
-            TextField("Signal", text: $m.signal).keyboardType(.numberPad)
-                .textFieldStyle(.roundedBorder)
+            TextField("PID", text: $m.pid).keyboardType(.numberPad).textFieldStyle(.roundedBorder)
+            TextField("Signal", text: $m.signal).keyboardType(.numberPad).textFieldStyle(.roundedBorder)
         }
         btn("List processes") { m.listProcesses() }
         HStack {
@@ -1003,12 +1180,10 @@ struct DebugServerView: View {
             HStack {
                 Text(m.status).font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    UIPasteboard.general.string = m.output
-                } label: { Label("Copy", systemImage: "doc.on.doc").font(.caption) }
-                Button {
-                    m.output = ""; m.status = ""
-                } label: { Label("Clear", systemImage: "trash").font(.caption) }
+                Button { UIPasteboard.general.string = m.output }
+                    label: { Label("Copy", systemImage: "doc.on.doc").font(.caption) }
+                Button { m.output = ""; m.status = "" }
+                    label: { Label("Clear", systemImage: "trash").font(.caption) }
             }
             ScrollView {
                 Text(m.output.isEmpty ? "No output yet." : m.output)
@@ -1028,8 +1203,7 @@ struct DebugServerView: View {
         Button(action: action) {
             Text(title)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 10)
-                .padding(.horizontal, 12)
+                .padding(.vertical, 10).padding(.horizontal, 12)
                 .background(color.opacity(0.15))
                 .foregroundStyle(color)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
