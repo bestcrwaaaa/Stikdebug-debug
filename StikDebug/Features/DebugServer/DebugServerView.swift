@@ -288,6 +288,7 @@ final class DebugServerViewModel: ObservableObject {
     @Published var startSuspended = false
     @Published var killExisting = false
     @Published var lastLaunchedPID: String = ""
+    @Published var lastAuditToken: String = ""
 
     init() {
         // Global TCP timeout — prevents deadlocks in DVT / debug / os_trace reads
@@ -939,6 +940,12 @@ final class DebugServerViewModel: ObservableObject {
         }
     }
 
+    nonisolated private func await_setLastAuditToken(_ hex: String) {
+        Task { @MainActor [weak self] in
+            self?.lastAuditToken = hex
+        }
+    }
+
     func pcKillApp() {
         guard let p = UInt64(pid) else { output = "✗ pid"; return }
         run("process_control kill \(p)…") {
@@ -1506,6 +1513,26 @@ struct DebugServerView: View {
         if !m.lastLaunchedPID.isEmpty {
             Text("last launched pid: \(m.lastLaunchedPID)")
                 .font(.caption).foregroundStyle(.secondary)
+        }
+        if !m.lastAuditToken.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("audit_token (\(m.lastAuditToken.count / 2) bytes)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        UIPasteboard.general.string = m.lastAuditToken
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc").font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Text(m.lastAuditToken)
+                    .font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(4)
+            }
+            .padding(.vertical, 4)
         }
     }
 
