@@ -190,27 +190,34 @@ final class DebugServerViewModel: ObservableObject {
             do {
                 let processes = try JITEnableContext.shared.fetchProcessList()
 
-                // Дамп первого словаря для отладки ключей
+                // Дамп первого элемента для отладки ключей
                 if let first = processes.first {
-                    print("=== PROCESS DICT KEYS: \(first.keys) ===")
                     print("=== PROCESS DICT: \(first) ===")
+                    print("=== PROCESS DICT KEYS: \(first.allKeys) ===")
                 }
 
                 let text = processes.map { entry -> String in
-                    let name = (entry["name"] as? String)
-                        ?? (entry["Name"] as? String)
-                        ?? (entry["executable"] as? String)
-                        ?? (entry["Executable"] as? String)
-                        ?? "?"
-                    let pidValue = (entry["pid"] as? Int)
-                        ?? (entry["PID"] as? Int)
-                        ?? (entry["pid"] as? Int32).map { Int($0) }
-                        ?? 0
+                    // entry is NSDictionary — subscript returns Any?
+                    let rawName = entry["name"] as? String
+                        ?? entry["Name"] as? String
+                        ?? entry["executable"] as? String
+                        ?? entry["Executable"] as? String
+                    let name = rawName ?? "?"
+
+                    let pidValue: Int = {
+                        if let v = entry["pid"] as? Int { return v }
+                        if let v = entry["PID"] as? Int { return v }
+                        if let v = entry["pid"] as? Int32 { return Int(v) }
+                        if let n = entry["pid"] as? NSNumber { return n.intValue }
+                        return 0
+                    }()
+
                     let path = (entry["executablePath"] as? String)
                         ?? (entry["path"] as? String)
                         ?? (entry["Path"] as? String)
                         ?? (entry["bundleIdentifier"] as? String)
                         ?? ""
+
                     return "\(pidValue)\t\(name)\t\(path)"
                 }.joined(separator: "\n")
 
