@@ -28,7 +28,13 @@ private func ideviceErrorString(_ err: UnsafeMutablePointer<IdeviceFfiError>?) -
 }
 
 private func makeFileDomain(_ raw: Int) -> IdeviceFileServiceDomain {
-    IdeviceFileServiceDomain(rawValue: UInt32(raw)) ?? IdeviceFileServiceDomainSystemCrashLogs
+    switch raw {
+    case 1: return IdeviceFileServiceDomainAppDataContainer
+    case 2: return IdeviceFileServiceDomainAppGroupDataContainer
+    case 3: return IdeviceFileServiceDomainTemporary
+    case 5: return IdeviceFileServiceDomainSystemCrashLogs
+    default: return IdeviceFileServiceDomainSystemCrashLogs
+    }
 }
 
 private func previewBytes(_ data: Data) -> String {
@@ -921,7 +927,7 @@ final class DebugServerViewModel: ObservableObject {
                     throw NSError(domain: "pc", code: Int(err.pointee.code),
                                   userInfo: [NSLocalizedDescriptionKey: "launch: \(ideviceErrorString(err) ?? "?")"])
                 }
-                await_setLastPID(pidOut)
+                self.await_setLastPID(pidOut)
                 return "OK — launched pid \(pidOut)"
             }
         }
@@ -990,7 +996,7 @@ final class DebugServerViewModel: ObservableObject {
                 guard let response else { return "<nil>" }
                 let pid = response.pointee.pid
                 let path = response.pointee.executable_url.map { String(cString: $0) } ?? "?"
-                await_setLastPID(UInt64(pid))
+                self.await_setLastPID(UInt64(pid))
                 return "OK — pid \(pid)\nurl: \(path)"
             }
         }
