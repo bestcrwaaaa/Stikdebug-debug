@@ -299,12 +299,7 @@ private enum Tunnel {
             defer { file_service_free(control) }
 
             // Known enum cases → safe path. Arbitrary raw → bitcast (C enum ABI is UInt32).
-            let dom: IdeviceFileServiceDomain
-            if let d = IdeviceFileServiceDomain(rawValue: domain) {
-                dom = d
-            } else {
-                dom = unsafeBitCast(domain, to: IdeviceFileServiceDomain.self)
-            }
+            let dom: IdeviceFileServiceDomain = unsafeBitCast(domain, to: IdeviceFileServiceDomain.self)
 
             var sessionID: UnsafeMutablePointer<CChar>?
             var createErr: UnsafeMutablePointer<IdeviceFfiError>?
@@ -845,6 +840,59 @@ final class DebugServerViewModel: ObservableObject {
         let bundle = bundleID
         run("DVT create \(path)…") {
             try Tunnel.fileService(domain: domainRaw, bundleID: bundle) { control, _, _ in
+                let now = Int64(Date().timeIntervalSince1970)
+                if let e = path.withCString({
+                    file_service_propose_empty_file(control, $0, 0o644, 501, 501, now, now)
+                }) {
+                    throw NSError(domain: "fs", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "propose: \(ideviceErrorString(e) ?? "?")"])
+                }
+                return "OK — file created"
+            }
+        }
+    }
+
+    // MARK: Files (DVT raw — additive)
+
+    private func parseRawDomain() -> UInt32? {
+        let s = dvtDomainText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
+        if let v = UInt32(s) { return v }
+        if s.lowercased().hasPrefix("0x"), let v = UInt32(s.dropFirst(2), radix: 16) { return v }
+        return nil
+    }
+
+    func readFileDVTRaw() {
+        let path = dvtPathRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { output = "✗ empty path"; status = "Rejected"; return }
+        guard let domNum = parseRawDomain() else {
+            output = "✗ invalid domain: \(dvtDomainText)"; status = "Rejected"; return
+        }
+        let ident: String? = dvtUseNilIdentifier ? nil : (dvtIdentifierOverride.isEmpty ? nil : dvtIdentifierOverride)
+        run("DVT raw read dom=\(domNum)…") {
+            try Tunnel.fileServiceRaw(domain: domNum, identifier: ident) { control, adapter, dataPort in
+                var data: UnsafeMutablePointer<UInt8>?
+                var len: UInt = 0
+                if let e = path.withCString({ file_service_retrieve_file(control, $0, adapter, dataPort, &data, &len) }) {
+                    throw NSError(domain: "fs", code: Int(e.pointee.code),
+                                  userInfo: [NSLocalizedDescriptionKey: "retrieve_file: \(ideviceErrorString(e) ?? "?")"])
+                }
+                defer { if let data { idevice_data_free(data, len) } }
+                guard let data, len > 0 else { return "<empty>" }
+                return previewBytes(Data(bytes: data, count: Int(len)))
+            }
+        }
+    }
+
+    func proposeEmptyFileDVTRaw() {
+        let path = dvtPathRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { output = "✗ empty path"; status = "Rejected"; return }
+        guard let domNum = parseRawDomain() else {
+            output = "✗ invalid domain: \(dvtDomainText)"; status = "Rejected"; return
+        }
+        let ident: String? = dvtUseNilIdentifier ? nil : (dvtIdentifierOverride.isEmpty ? nil : dvtIdentifierOverride)
+        run("DVT raw create dom=\(domNum)…") {
+            try Tunnel.fileServiceRaw(domain: domNum, identifier: ident) { control, _, _ in
                 let now = Int64(Date().timeIntervalSince1970)
                 if let e = path.withCString({
                     file_service_propose_empty_file(control, $0, 0o644, 501, 501, now, now)
